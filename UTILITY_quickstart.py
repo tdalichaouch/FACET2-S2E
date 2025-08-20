@@ -28,6 +28,7 @@ from UTILITY_setLattice import setLattice, getBendkG, getQuadkG, getSextkG, setB
 from UTILITY_impact import runImpact
 from UTILITY_OpenPMDtoBmad import OpenPMD_to_Bmad
 from UTILITY_finalFocusSolver import finalFocusSolver
+from UTILITY_QPAD import QPAD_sim, run_QPAD
 
 import os
 import yaml
@@ -43,7 +44,7 @@ def initializeTao(
     numMacroParticles = None,
     runImpactTF = False,
     inputBeamFilePathSuffix = None,
-    
+    runQPAD = False,
     scratchPath = None,
     randomizeFileNames = False,
     
@@ -116,6 +117,7 @@ def initializeTao(
         tao=Tao('-init {:s}/bmad/models/f2_elec/tao_transverseWakesOn.init -noplot'.format(environ['FACET2_LATTICE'])) 
     else:
         tao=Tao('-init {:s}/bmad/models/f2_elec/tao.init -noplot'.format(environ['FACET2_LATTICE'])) 
+        print('-init {:s}/bmad/models/f2_elec/tao.init -noplot'.format(environ['FACET2_LATTICE']))
 
     tao.filePathGlobal = filePathGlobal #Put this into the tao object immediately. Needed early in the initialization
     
@@ -153,12 +155,18 @@ def initializeTao(
         randomPath = str(int.from_bytes(os.urandom(8), "big"))
         activeFilePath = f'{scratchPath}/beams/activeBeamFile_{randomPath}.h5'
         patchFilePath = f'{scratchPath}/beams/patchBeamFile_{randomPath}.h5'
+        qpadSimPath = f'{scratchPath}/beams/qpad_sim_{randomPath}'
     else:
         activeFilePath = f'{scratchPath}/beams/activeBeamFile.h5'
         patchFilePath = f'{scratchPath}/beams/patchBeamFile.h5'
+        qpadSimPath = f'{scratchPath}/beams/qpad_sim'
 
     # Create 'beams' folder if it doesn't exist
     os.makedirs(f"{scratchPath}/beams", exist_ok=True)
+
+    # create 'qpad' sim folder if it doesn't exist
+    if(run_QPAD):
+        os.makedirs(qpadSimPath, exist_ok=True)
     
     if runImpactTF:
         if not numMacroParticles:
@@ -187,7 +195,6 @@ def initializeTao(
         else:
             print(f"Number of macro particles defined by input file")
 
-
     #Create the beam
     modifyAndSaveInputBeam(
             inputBeamFilePath,
@@ -206,6 +213,8 @@ def initializeTao(
     tao.inputBeamFilePath = inputBeamFilePath
     tao.activeFilePath = activeFilePath
     tao.patchFilePath = patchFilePath
+    tao.qpadSimPath = qpadSimPath
+    tao.runQPAD = runQPAD
     #tao.activeBeam = activeBeam
 
 
@@ -246,6 +255,7 @@ def trackBeam(
     allCollimatorRules = None,
     centerMFFF = False,
     verbose = False,
+    plasmaSIM = False,
     **kwargs,
 ):
     """Tracks the beam in activeBeamFile.h5 through the lattice presently in tao from trackStart to trackEnd
@@ -261,7 +271,6 @@ def trackBeam(
      * Refer to collimateBeam(). Collimator positions passed as allCollimatorRules
     """
     global filePathGlobal
-
 
     tao.cmd(f'set beam_init position_file={tao.activeFilePath}')
     tao.cmd('reinit beam')
@@ -280,8 +289,9 @@ def trackBeam(
     BC14BEGS     = tao.ele_param("BEGBC14_1","ele.s")['ele_s']
     BC20BEGS     = tao.ele_param("BEGBC20","ele.s")['ele_s']
     BC20COLLS    = tao.ele_param("CN2069","ele.s")['ele_s']
+    PENTS        = tao.ele_param("PENT","ele.s")['ele_s']
     MFFFS        = tao.ele_param("MFFF","ele.s")['ele_s']
-
+    PEXIT        = tao.ele_param("PEXT","ele.s")['ele_s']
     
     if laserHeater and trackStartS < laserHeaterS < trackEndS:
         #Will track from start to HTRUNDF, get the beam, modify it, export it, import it, update track_start and track_end
@@ -407,6 +417,7 @@ def trackBeam(
         tao.cmd(f'set beam_init track_end = {trackEnd}')
         if verbose: print(f"Set track_start = CN2069, track_end = {trackEnd}")
 
+
     if centerMFFF and trackStartS < MFFFS < trackEndS:
         tao.cmd(f'set beam_init track_end = MFFF')
         if verbose: print(f"Set track_end = MFFF")
@@ -428,6 +439,35 @@ def trackBeam(
         tao.cmd(f'set beam_init track_start = MFFF')
         tao.cmd(f'set beam_init track_end = {trackEnd}')
         if verbose: print(f"Set track_start = MFFF, track_end = {trackEnd}")
+
+
+    if plasmaSIM and trackStartS < PEXIT < trackEndS:
+        ## propagate to PEXIT
+        tao.cmd(f'set beam_init track_end = PEXT')
+        if verbose: print(f"Set track_end = PEXT")
+
+        if verbose: print(f"Tracking!")
+        trackBeamHelper(tao)
+
+        P = getBeamAtElement(tao, "PENT", tToZ = False)
+        
+        writeBeam(P, tao.patchFilePath)
+        if verbose: print(f"Beam at PENT written to {tao.patchFilePath}")
+
+        if verbose: print(f"Running QPAD simulation at PENT!")
+        final_step = run_QPAD(tao)
+        
+
+        P = getBeamfromQPAD(f'{tao.qpadSimPath}/Beam1/Raw/raw_' + str(100000000 + final_step)[1:] + '.h5')
+        writeBeam(P, tao.patchFilePath)
+        tao.cmd(f'set beam_init position_file={tao.patchFilePath}')
+        tao.cmd('reinit beam')
+        if verbose: print(f"Loaded {tao.patchFilePath}")
+
+        tao.cmd(f'set beam_init track_start = PEXT')
+        tao.cmd(f'set beam_init track_end = {trackEnd}')
+        if verbose: print(f"Set track_start = PEXT, track_end = {trackEnd}")
+
 
     if verbose: print(f"Tracking!")
     trackBeamHelper(tao)
@@ -478,6 +518,35 @@ def getBeamAtElement(tao, eleString, tToZ = True):
     """
     
     P = ParticleGroup(data=tao.bunch_data(eleString))
+    P = P[P.status == 1]
+
+    #Naive implementation for "typical" beams. ParticleGroup has .drift_to_z but I couldn't get it to work...
+    if tToZ:
+        P.z = -299792458 * P["delta_t"]
+        #P.t = 0 * P.t #I haven't decided the best practice for this yet. Technically the beam is not self-consistent without t being set to zero but not doing so is convenient for backwards compatibility
+        
+    return P
+
+
+def getBeamfromQPAD(eleString, tToZ = True):
+    """Queries tao for the beam at an element
+    
+    Parameters
+    ----------
+    tao : pytao object
+
+    eleString : str, int
+        Either the name or lattice index of the element where the beam is to be found
+
+    tToZ : bool
+        Set P.z to -ct
+
+    Returns
+    -------
+    ParticleGroup beam
+    """
+    
+    P = ParticleGroup(eleString)
     P = P[P.status == 1]
 
     #Naive implementation for "typical" beams. ParticleGroup has .drift_to_z but I couldn't get it to work...

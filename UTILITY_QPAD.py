@@ -7,7 +7,7 @@ from scipy.optimize import fsolve
 from scipy.special import erf
 from scipy.interpolate import interp1d
 from scipy.constants import physical_constants
-import subprocess, os 
+import subprocess, os, sys, yaml
 
 cst = picmi.constants
 
@@ -67,18 +67,18 @@ class QPAD_sim:
 		components for higher modes).
 		
 	"""
-	def init_grid(self,nr = None, nz = None, zmin = None, zmax = None, rmin = 0, rmax = None, n_modes = 1):
+	def init_grid(self,nr = None, nz = None, z = None, r = None, n_modes = 1, max_iterations = 3):
 		self.grid = picmi.CylindricalGrid(
 			number_of_cells           = [nr, nz],
-			lower_bound               = [0. , zmin],
-			upper_bound               = [rmax, zmax],
+			lower_bound               = [r[0] , z[0]],
+			upper_bound               = [r[1], z[1]],
 			lower_boundary_conditions = ['open', 'open'],
 			upper_boundary_conditions = ['open', 'open'],
 			n_azimuthal_modes = n_modes,
 			moving_window_velocity    = [0,cst.c])
 
-
-		self.solver = picmi.ElectromagneticSolver( grid = self.grid )
+		solver_dict = { picmi.codename + '_maximum_iterations' : max_iterations }
+		self.solver = picmi.ElectromagneticSolver( grid = self.grid, **solver_dict)
 
 
 	"""
@@ -102,28 +102,71 @@ class QPAD_sim:
 		RMS velocity in units of sigma_p/mc (unitless)
 		
 	"""
-	def add_openpmd_file_bunch(self, pmd_file_in, qpad_file_out, op = np.median, directory = '.'):
+	def add_openpmd_file_bunch(self, pmd_file_in, qpad_file_out, op = np.median, directory = '.', z_select=False, curr_filt = 0):
 		assert self.grid is not None, Exception("Must initialize grid before adding OpenPMD bunch")
 		
-		## simulation paramters ##
 		P = ParticleGroup(pmd_file_in)
 		P = P[P.status == 1]
 		q_grid_norm = (2 * np.pi * self.grid.dr**2 * self.grid.dz) 
 		q_raw_norm = (cst.q_e * self.n0 )
 		scale_q = 1.0/(q_grid_norm * q_raw_norm)
 		scale_p = 1/(0.511e6)
-
-
+		
 		dataset = P.copy() # modify a copy of P
-		dataset.x = dataset.x - op(dataset.x) # adjust beam x
-		dataset.y = dataset.y - op(dataset.y) # adjust beam y
-		dataset.z = cst.c * (op(dataset.t) - dataset.t) # calculate z and center beam at high current region
+		self.dist = np.average(dataset.t * cst.c + dataset.z)
+		if(z_select):
+			self.shift_z =  op(dataset.z)
+			dataset.z = (dataset.z -self.shift_z)
+		else:
+			dt = op(dataset.t)
+			self.shift_z = self.dist - cst.c * dt
+			dataset.z = cst.c * (dt - dataset.t) # calculate z and center beam at high current region
+		nslices = 200
+		q_ch = np.copy(dataset.weight)
+		z_ch = np.copy(dataset.z)
+		zlin = np.linspace(np.min(z_ch), np.max(z_ch),nslices+1)
+		curr = np.zeros(nslices)
+		dt = (zlin[1]-zlin[0])/cst.c
+		for j in range(nslices):
+			z1, z2 = zlin[j], zlin[j+1]
+			filt = np.logical_and(z_ch > z1, z_ch < z2)
+			curr[j] = np.sum(q_ch[filt])/dt
+		zlin = 0.5 * (zlin[1:] + zlin[:-1])
+		filt_final = curr > curr_filt
+		zmin,zmax = np.min(zlin[filt_final]), np.max(zlin[filt_final])
+		
+		group = dataset.where(np.logical_and(dataset.z > zmin, dataset.z < zmax))
+		# print('subset charge :', np.sum(group.weight))
+		dispx = np.median(group.x)
+		dispy = np.median(group.y) 
+		
+		x_prime = group.px/group.pz
+		y_prime = group.py/group.pz
+		driftx = np.average(x_prime)
+		drifty = np.average(y_prime)
 
-		x, y, z = self.kp * dataset.x, self.kp * dataset.y, self.kp * dataset.z
+		adjustxp = driftx
+		adjustyp = drifty
+	
+		dispx,dispy = np.mean(group.x),np.mean(group.y)
+
+			
+		self.filt_charge = np.sum(group.weight)
+		
+		self.shift_x = dispx 
+		self.shift_y = dispy
+		self.shift_xp = adjustxp
+		self.shift_yp = adjustyp
+
+		
+
+		x, y, z = self.kp * (dataset.x-dispx), self.kp * (dataset.y-dispy), self.kp * dataset.z
 		px, py, pz = dataset['px']*scale_p, dataset['py']*scale_p, dataset['pz']*scale_p
+		px -= pz * adjustxp
+		py -= pz * adjustyp
+
 
 		q = dataset.weight *scale_q
-
 		hf = h5py.File(directory + '/' + qpad_file_out, 'w')
 		hf.create_dataset('x1', data=x)
 		hf.create_dataset('x2', data=y)
@@ -133,7 +176,7 @@ class QPAD_sim:
 		hf.create_dataset('p3', data=pz)
 		hf.create_dataset('q',data=-np.abs(q))
 		hf.close()
-
+		# print(np.min(z),np.max(z),'min/max z')
 		self.species_list.append(picmi.Species( particle_type = 'electron', 
 			initial_distribution = picmi.OpenPMDFileDistribution(qpad_file_out)))
 		self.if_beam.append(True)
@@ -220,6 +263,48 @@ class QPAD_sim:
 					n_macroparticle_per_cell = ppc, 
 					**layout_dict))
 		self.if_beam.append(False)
+
+
+	"""
+	Add longitudinal plasma profile
+
+	Parameters
+	----------
+	z: array of floats
+		Longitudinal position of neutral gas profile [m].
+
+	nz: array of floats
+		Number density of neutral gas profile [m^-3].
+
+	n0_factor: float
+		Normalizing density factor [m^-3].
+
+	ppc: list of 2 integers, default = [4, 1]
+		ppc along r and phi. ppc(1) * ppc(2) = total macroelectrons 
+		per cell (default is 4)
+
+	num_theta: 
+		integer, default = 8
+		ppc along azimuthal direction
+		
+	"""
+	def add_longitudinal_plasma_profile(self, z, nz, ppc = [4, 1], num_theta = 8):
+		if(self.grid is None):
+			print("Warning: Initialize grid before adding neutral gas")
+			return
+		assert self.grid is not None, Exception("Must initialize grid before adding Plasma")
+
+		self.species_list.append(picmi.Species(particle_type = particle_type, 
+			initial_distribution = picmi.PiecewiseDistribution(density = self.n0, piecewise_s = z, piecewise_fs = nz), 
+			**neut_dict ))
+
+		layout_dict = { picmi.codename + '_num_theta' : num_theta }
+		self.layouts.append(picmi.GriddedLayout(
+					grid = self.grid,
+					n_macroparticle_per_cell = ppc, 
+					**layout_dict))
+		self.if_beam.append(False)
+
 
 
 	"""
@@ -346,8 +431,8 @@ class QPAD_sim:
 			if(self.if_beam[i]):
 				beam_list.append(self.species_list[i])
 		self.part_diags.append(picmi.ParticleDiagnostic(period = period,
-                             species = beam_list,
-                              **part_diag_dict))
+							 species = beam_list,
+							  **part_diag_dict))
 
 	"""
 	Adds Field Diagnostic to data dumps
@@ -363,8 +448,8 @@ class QPAD_sim:
 	"""
 	def add_field_diagnostics(self, data_list = [], period = 1):
 		self.field_diags.append(picmi.FieldDiagnostic(data_list = data_list,
-	                                   grid = self.grid,
-	                                   period = period))
+									   grid = self.grid,
+									   period = period))
 
 
 	"""
@@ -382,7 +467,7 @@ class QPAD_sim:
 		mpi procs along r and z
 		
 	"""
-	def run_simulation(self,dt, tmax, nodes = [1, 1], sim_dir = '.', path_to_qpad = '.'):
+	def run_simulation(self,dt, tmax, nodes = [1, 1], sim_dir = '.'):
 		sim_dict = { picmi.codename + '_nodes' : nodes, picmi.codename + '_n0' : self.n0}
 		self.simulation = picmi.Simulation(solver = self.solver, verbose = 1,
 			time_step_size = dt, max_time = tmax, **sim_dict)
@@ -395,136 +480,230 @@ class QPAD_sim:
 
 		for i in range(len(self.part_diags)):
 			self.simulation.add_diagnostic(self.part_diags[i])
-
-
+		
 		self.simulation.write_input_file(sim_dir+ '/qpinput.json')
-		# todo add mpi script
-		# subprocess ....
 		env = dict(os.environ)
-		env['LD_LIBRARY_PATH'] ='/sdf/group/facet/codes/qpad_libs_openmpi/json-fortran/build/lib:'  + env['LD_LIBRARY_PATH']
+		if('CONDA_PREFIX' in env):
+			env['PATH'] =env['CONDA_PREFIX'] + '/bin:'  + env['PATH']
 		procs = np.prod(nodes)
-		subprocess.run(["mpirun", "-np", str(procs), path_to_qpad + "/qpad.e"], cwd = sim_dir, env=env)
+		# subprocess.run(['mpirun', "-np", str(procs), "qpad.e"], cwd = sim_dir, env=env)
+		proc = subprocess.Popen(
+			['mpirun', "-np", str(procs), "qpad.e"],
+			stdout=subprocess.PIPE,
+			text=True,
+			cwd = sim_dir, 
+			env=env
+		)
 
+		for line in proc.stdout:
+			# Remove newline
+			line = line.rstrip()
+			# Print, overwriting the same line
+			sys.stdout.write("\r" + line + " " * 30)
+			sys.stdout.flush()
 
+		proc.wait()
+		print()  # final newline
 		
 
 
 
-	""" 
-	Generates the plasma density of the lithium oven/helium as a function of z position.
+""" 
+Generates the plasma density of the lithium oven/helium as a function of z position.
 
-	The position and density at each position is returned as output in the following order:
+The position and density at each position is returned as output in the following order:
 
-	[z array, Lithium density array, Helium density array]
+[z array, Lithium density array, Helium density array]
 
-	Args:
-	    Nz: Number of positions in z.
-	    Z: [m] Maximum z position to generate, inclusive.
-	    P: [torr] Buffer gas pressure.
-	    T_bkgd: [K] Temperature of the background He buffer gas.
-	    l_He: [m] Length of He density to use from thermodynamics calulation. Interpolation
-	        is used outside of this region.
-	    filename_Li: Filename to output the Li density to.
-	    filename_He: Filename to output the He density to.
-	"""
-	def generate_Li_oven_profile(self, Nz = 1001, Z = 0.6, P = 5.0, T_bkgd = 273.15, l_He = 0.44 ):
+Args:
+	Nz: Number of positions in z.
+	Z: [m] Maximum z position to generate, inclusive.
+	P: [torr] Buffer gas pressure.
+	T_bkgd: [K] Temperature of the background He buffer gas.
+	l_He: [m] Length of He density to use from thermodynamics calulation. Interpolation
+		is used outside of this region.
+	filename_Li: Filename to output the Li density to.
+	filename_He: Filename to output the He density to.
+"""
+def generate_Li_oven_profile(Nz = 1001, Z = 0.6, P = 5.0, T_bkgd = 273.15, l_He = 0.44 ):
 
-		# Calculation variables
-		z = np.linspace(0.0, Z, Nz)
-		n = np.zeros(Nz, dtype="double")
-		center = Z / 2
-		kB = physical_constants["Boltzmann constant"][0]
-
-
-		# Lithium properties
-		def Pv(T):
-		    """Calculates the vapor pressure of the lithium gas as a function of temperature.
-
-		    Args:
-		        T: [K] temperature of the lithium gas.
-
-		    Returns:
-		        Pv: [torr] vapor pressure of the lithium.
-		    """
-		    T = T * 1e-3
-		    return np.exp(-2.0532 * np.log(T) - 19.4268 / T + 9.4993 + 0.753 * T) / 133.0e-6
+	# Calculation variables
+	z = np.linspace(0.0, Z, Nz)
+	n = np.zeros(Nz, dtype="double")
+	center = Z / 2
+	kB = physical_constants["Boltzmann constant"][0]
 
 
-		def f(T):
-		    return Pv(T) - P
+	# Lithium properties
+	def Pv(T):
+		"""Calculates the vapor pressure of the lithium gas as a function of temperature.
+
+		Args:
+			T: [K] temperature of the lithium gas.
+
+		Returns:
+			Pv: [torr] vapor pressure of the lithium.
+		"""
+		T = T * 1e-3
+		return np.exp(-2.0532 * np.log(T) - 19.4268 / T + 9.4993 + 0.753 * T) / 133.0e-6
 
 
-		T = fsolve(f, 1000.0)[0]
-		ne = 9.66e24 * P / T
-
-		# Background lithium density - necessary for find He density
-		Pv_bkgd = Pv(T_bkgd)
-		n_bkgd = 9.66e24 * Pv_bkgd / T_bkgd
-
-		# Uniform accelerating plasma
-		length = 238e-3
-		z_start = center - 0.5 * length
-		z_end = center + 0.5 * length
-		sel = (z > z_start) * (z < z_end)
-		n[sel] = 1.0
-
-		# Entrance ramp - error function
-		ent_start = center - 400.0e-3
-		s_ent = 22.0e-3
-		sel = (z >= ent_start) * (z <= z_start)
-		n[sel] = 0.5 * (1 + erf((z[sel] - z_start + 100.0e-3) / (np.sqrt(2) * s_ent)))
-		n[sel] *= 1.0 / n[sel][-1]  # Make sure curve is continuous
-
-		# Exit ramp - error function
-		exit_end = center + 400.0e-3
-		s_ext = 22.0e-3
-		sel = (z >= z_end) * (z <= exit_end)
-		n[sel] = 0.5 * (1 + erf(-(z[sel] - z_end - 100.0e-3) / (np.sqrt(2) * s_ext)))
-		n[sel] *= 1.0 / n[sel][0]  # Make sure curve is continuous
-
-		n *= ne
-		n += n_bkgd
-
-		# Save the Li plasma density file
-		data = np.stack((z, n), axis=1)
-
-		# Calculate He plasma density
-		# First create interpolations to go from density to temperature and Li pressure
-		T_int = np.linspace(200, 1200, 1001)
-		P_int = Pv(T_int)
-		n_int = 9.66e24 * P_int / T_int
-		T_from_n = interp1d(n_int, T_int)
-		P_from_n = interp1d(n_int, P_int)
-
-		# Find the temperature and Li pressure along the oven, then calculate He density
-		T_n = T_from_n(n)
-		P_n = P_from_n(n)
-		n_He = ((P - P_n) * 133.32236842) / (kB * T_n)
-		n_He_bkgd = ((P) * 133.32236842) / (kB * T_bkgd)
-
-		# Above meathod breaks down at low Li pressure, use linear interpolation from the ramps
-		z_HeStart = center - 0.5 * l_He
-		z_HeEnd = center + 0.5 * l_He
-		nHe = np.zeros(Nz)
-		sel = (z > z_HeStart) * (z < z_HeEnd)
-		nHe[sel] = n_He[sel]
-
-		# Extend linearly from the ends
-		slope = (nHe[sel][10] - nHe[sel][0]) / (z[sel][10] - z[sel][0])
-		selUp = z <= z_HeStart
-		nHe[selUp] = slope * (z[selUp] - z[sel][0]) + nHe[sel][0]
-		selDown = z >= z_HeEnd
-		nHe[selDown] = -slope * (z[selDown] - z[sel][-1]) + nHe[sel][-1]
-
-		# Set to background density
-		sel = nHe > n_He_bkgd
-		nHe[sel] = n_He_bkgd
-
-		data = np.stack((z, nHe), axis=1)
-
-		return [z, n, nHe]
+	def f(T):
+		return Pv(T) - P
 
 
+	T = fsolve(f, 1000.0)[0]
+	ne = 9.66e24 * P / T
+
+	# Background lithium density - necessary for find He density
+	Pv_bkgd = Pv(T_bkgd)
+	n_bkgd = 9.66e24 * Pv_bkgd / T_bkgd
+
+	# Uniform accelerating plasma
+	length = 238e-3
+	z_start = center - 0.5 * length
+	z_end = center + 0.5 * length
+	sel = (z > z_start) * (z < z_end)
+	n[sel] = 1.0
+
+	# Entrance ramp - error function
+	ent_start = center - 400.0e-3
+	s_ent = 22.0e-3
+	sel = (z >= ent_start) * (z <= z_start)
+	n[sel] = 0.5 * (1 + erf((z[sel] - z_start + 100.0e-3) / (np.sqrt(2) * s_ent)))
+	n[sel] *= 1.0 / n[sel][-1]  # Make sure curve is continuous
+
+	# Exit ramp - error function
+	exit_end = center + 400.0e-3
+	s_ext = 22.0e-3
+	sel = (z >= z_end) * (z <= exit_end)
+	n[sel] = 0.5 * (1 + erf(-(z[sel] - z_end - 100.0e-3) / (np.sqrt(2) * s_ext)))
+	n[sel] *= 1.0 / n[sel][0]  # Make sure curve is continuous
+
+	n *= ne
+	n += n_bkgd
+
+	# Save the Li plasma density file
+	data = np.stack((z, n), axis=1)
+
+	# Calculate He plasma density
+	# First create interpolations to go from density to temperature and Li pressure
+	T_int = np.linspace(200, 1200, 1001)
+	P_int = Pv(T_int)
+	n_int = 9.66e24 * P_int / T_int
+	T_from_n = interp1d(n_int, T_int)
+	P_from_n = interp1d(n_int, P_int)
+
+	# Find the temperature and Li pressure along the oven, then calculate He density
+	T_n = T_from_n(n)
+	P_n = P_from_n(n)
+	n_He = ((P - P_n) * 133.32236842) / (kB * T_n)
+	n_He_bkgd = ((P) * 133.32236842) / (kB * T_bkgd)
+
+	# Above meathod breaks down at low Li pressure, use linear interpolation from the ramps
+	z_HeStart = center - 0.5 * l_He
+	z_HeEnd = center + 0.5 * l_He
+	nHe = np.zeros(Nz)
+	sel = (z > z_HeStart) * (z < z_HeEnd)
+	nHe[sel] = n_He[sel]
+
+	# Extend linearly from the ends
+	slope = (nHe[sel][10] - nHe[sel][0]) / (z[sel][10] - z[sel][0])
+	selUp = z <= z_HeStart
+	nHe[selUp] = slope * (z[selUp] - z[sel][0]) + nHe[sel][0]
+	selDown = z >= z_HeEnd
+	nHe[selDown] = -slope * (z[selDown] - z[sel][-1]) + nHe[sel][-1]
+
+	# Set to background density
+	sel = nHe > n_He_bkgd
+	nHe[sel] = n_He_bkgd
+
+	data = np.stack((z, nHe), axis=1)
+
+	return [z, n, nHe]
+
+# aux functions for dictionary lookup
+def eq(s, t):
+	return s.lower() == t.lower()
+
+def get(table, key):
+	try:
+		val = table[key]
+		return val
+	except:
+		print(f"Error looking up key {str(key)} in QPAD settings file")
+		return None
+
+""" 
+Runs QPAD simulation with settings specified in defaultsFile
+
+Args:
+	tao: Pytao instance
+	defaultsFile: Path to yml specifying default parameters
+"""
+def run_QPAD(tao,
+	defaultsFile=None,
+	verbose = False,
+	**overrides):
+
+	# read in QPAD settings from file
+	if not defaultsFile:
+		defaultsFile = f'{tao.filePathGlobal}/qpad/2025-08-20-QPAD_defaults.yml'
+		if verbose:
+			print(f"No defaults file provided to setLattice(). Using {defaultsFile}")
+		
+	with open(defaultsFile, 'r') as file:
+		defaults = yaml.safe_load(file)
+	# print(defaults)
+
+	try: 
+		sim_settings = defaults['simulation']
+		grid_settings = sim_settings['grid']
+		plasma_settings = defaults['plasma']
+	except:
+		print(f"Missing sections in {defaultsFile}!")
+
+
+
+
+	# read in plasma config
+	if(eq(plasma_settings['config'], 'oven')):
+		z, nLi, nHe = generate_Li_oven_profile(P = plasma_settings['P_torr'])
+		n0 = np.max(nLi)
+		zsim = z[-1]-0.01
+	
+
+	sim = QPAD_sim(n0)
+	kp, wp = sim.kp, sim.wp
+	sim.init_grid(nr = get(grid_settings, 'r_cells'), 
+					nz = get(grid_settings, 'z_cells'), 
+					r = get(grid_settings, 'r'), 
+					z = get(grid_settings, 'z'),
+					n_modes = get(grid_settings, 'max_mode'))
+
+
+	# reads patchFile and exports to QPAD-formatted file 'qpad_file.h5' in qpadSimPath
+	sim.add_openpmd_file_bunch(tao.patchFilePath,
+		'qpad_file.h5', 
+		directory = tao.qpadSimPath, 
+		z_select = False,
+		curr_filt = 1e3)
+	
+
+	if(eq(plasma_settings['config'], 'oven')):
+		num_theta = 8 * max(1, get(grid_settings, 'max_mode'))
+		if(not get(sim_settings, 'preionized')):
+			sim.add_longitudinal_neutral_gas_profile(z,  nLi, particle_type = 'Li', max_level = 1, num_theta = num_theta ) # model first level of Lithium
+			sim.add_longitudinal_neutral_gas_profile(z, np.abs(nHe), particle_type = 'He', max_level = 1, num_theta = num_theta ) # model first level of Helium
+		else:
+			sim.add_longitudinal_plasma_profile(z,  nLi, num_theta = num_theta ) # pre-ionized plasma
+	
+	dt_qpad = 20
+	ndump_penultimate_sim = int(kp * zsim/dt_qpad)-1
+	sim.add_particle_diagnostics(period = ndump_penultimate_sim ) 
+	print('Running QPAD Simulation')
+	sim.run_simulation(dt = dt_qpad/wp, tmax = zsim/cst.c, nodes = [int(i) for i in get(sim_settings, 'nprocs')], sim_dir = tao.qpadSimPath)
+	return ndump_penultimate_sim
 
 
 
