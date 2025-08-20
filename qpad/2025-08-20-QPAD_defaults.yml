@@ -1,0 +1,23 @@
+simulation:
+  grid:
+    r: [0, 100.e-06]
+    r_cells: 512
+    z: [-100.e-06, 200.e-06]
+    z_cells: 512
+    max_mode: 0 
+  if_timing: true # report timings
+  nprocs: [2, 2] 
+
+
+plasma:
+  config: oven # options are [oven or sfill]
+  gas: Li 
+  P_torr: 4 
+  preionized: false
+
+# example static fill example
+# plasma:
+#   config: sfill 
+#   gas: H2
+#   P_torr: 5.0
+#   preionized: false
