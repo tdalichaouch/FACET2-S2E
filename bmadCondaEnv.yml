@@ -16,7 +16,8 @@ dependencies:
   - lume-base=0.3.3
   - lume-impact=0.9.7
   - bayesian-optimization
-  - qpad
-  - openmpi
   - picmistandard
   - periodictable
+  - openpmd-viewer
+  - openmpi
+  - qpad

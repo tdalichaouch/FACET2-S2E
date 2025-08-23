@@ -43,9 +43,6 @@ requirements:
     - json-fortran
     - zlib
 
-  run:
-    - {{ mpi }}
-
 
 test:
   source_files:

@@ -73,6 +73,9 @@ def initializeTao(
     inputBeamFilePathSuffix : str
         Relative path from filePath to a file containing an intial beam
     
+    runQPAD : bool
+        Whether or not to run QPAD in plasma from PENT to PEXIT
+
     scratchPath : str
         Path to write scratch files. If used, typically set to "/tmp"
     randomizeFileNames : bool
@@ -291,7 +294,7 @@ def trackBeam(
     BC20COLLS    = tao.ele_param("CN2069","ele.s")['ele_s']
     PENTS        = tao.ele_param("PENT","ele.s")['ele_s']
     MFFFS        = tao.ele_param("MFFF","ele.s")['ele_s']
-    PEXIT        = tao.ele_param("PEXT","ele.s")['ele_s']
+    PEXITS        = tao.ele_param("PEXT","ele.s")['ele_s']
     
     if laserHeater and trackStartS < laserHeaterS < trackEndS:
         #Will track from start to HTRUNDF, get the beam, modify it, export it, import it, update track_start and track_end
@@ -441,7 +444,7 @@ def trackBeam(
         if verbose: print(f"Set track_start = MFFF, track_end = {trackEnd}")
 
 
-    if plasmaSIM and trackStartS < PEXIT < trackEndS:
+    if plasmaSIM and trackStartS < PEXITS < trackEndS:
         ## propagate to PEXIT
         tao.cmd(f'set beam_init track_end = PEXT')
         if verbose: print(f"Set track_end = PEXT")
@@ -450,16 +453,19 @@ def trackBeam(
         trackBeamHelper(tao)
 
         P = getBeamAtElement(tao, "PENT", tToZ = False)
-        
-        writeBeam(P, tao.patchFilePath)
-        if verbose: print(f"Beam at PENT written to {tao.patchFilePath}")
 
-        if verbose: print(f"Running QPAD simulation at PENT!")
-        final_step = run_QPAD(tao)
-        
+        # ballistic propagation from PENT to plasma
+        PENT_to_plasma = 0.25 # todo: replace with tao variable
+        ballisticPropagation(P, PENT_to_plasma) 
 
-        P = getBeamfromQPAD(f'{tao.qpadSimPath}/Beam1/Raw/raw_' + str(100000000 + final_step)[1:] + '.h5')
-        writeBeam(P, tao.patchFilePath)
+        # run plasma simulation
+        P2, lsim = run_QPAD(tao, P)
+        
+        # ballistic propagation from plasma to PEXIT
+        ds = max(PEXITS - (PENTS + PENT_to_plasma + lsim), 0.0)
+        ballisticPropagation(P2, ds)
+
+        writeBeam(P2, tao.patchFilePath)
         tao.cmd(f'set beam_init position_file={tao.patchFilePath}')
         tao.cmd('reinit beam')
         if verbose: print(f"Loaded {tao.patchFilePath}")
@@ -484,6 +490,22 @@ def trackBeam(
     
 #     tao.cmd('set global track_type = beam') #set "track_type = single" to return to single particle
 #     tao.cmd('set global track_type = single') #return to single to prevent accidental long re-evaluation
+
+
+def ballisticPropagation(P, distance):
+    """ Propagates ParticleGroup P ballistically over some distance
+    
+    Parameters
+    ----------
+    P: OpenPMD ParticleGroup
+    distance: propagation distance [m]
+
+    """
+    P.x = P.x + (P['px']/P['pz']) * distance
+    P.y = P.y + (P['py']/P['pz']) * distance
+    P.t = P.t + distance/299792458
+    # Update z?
+
 
 def trackBeamHelper(tao):
     """Wrap some of the tao commands with a try/except. This way if tracking doesn't work, we failsafe to track_type = single"""
@@ -527,34 +549,6 @@ def getBeamAtElement(tao, eleString, tToZ = True):
         
     return P
 
-
-def getBeamfromQPAD(eleString, tToZ = True):
-    """Queries tao for the beam at an element
-    
-    Parameters
-    ----------
-    tao : pytao object
-
-    eleString : str, int
-        Either the name or lattice index of the element where the beam is to be found
-
-    tToZ : bool
-        Set P.z to -ct
-
-    Returns
-    -------
-    ParticleGroup beam
-    """
-    
-    P = ParticleGroup(eleString)
-    P = P[P.status == 1]
-
-    #Naive implementation for "typical" beams. ParticleGroup has .drift_to_z but I couldn't get it to work...
-    if tToZ:
-        P.z = -299792458 * P["delta_t"]
-        #P.t = 0 * P.t #I haven't decided the best practice for this yet. Technically the beam is not self-consistent without t being set to zero but not doing so is convenient for backwards compatibility
-        
-    return P
 
 def nudgeMacroparticleWeights(
     PInput,
