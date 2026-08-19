@@ -1,0 +1,24 @@
+simulation:
+  grid:
+    r: [0, 250.e-06]
+    r_cells: 128
+    z: [-200.e-06, 100.e-06]
+    z_cells: 256
+    max_mode: 0
+  if_timing: true # report timings
+  nprocs: [1, 4] 
+
+diagnostics:
+  ndumps: 20 # [int] number of data dumps (particles always saved)
+  save_fields: true # [bool] toggle field data dump on/off  
+  field_quants: [rho, Ez] # options are [rho, Er, Bphi, Ez, ...]
+
+  
+plasma:
+  config: sfill # options are [oven or sfill]
+  gas: H2
+  P_torr: 1.35
+  preionized: True
+
+# example static fill config
+# to be added

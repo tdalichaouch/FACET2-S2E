@@ -698,6 +698,63 @@ def generate_Li_oven_profile(Nz = 1001, Z = 0.6, P = 5.0, T_bkgd = 273.15, l_He 
 
     return [z, n, nHe]
 
+
+""" 
+Returns H2 gas density of the static fill as a function of z position.
+
+Args:
+    P: [torr] H2 gas pressure.
+    T: [K] Temperature of the H2 gas.
+"""
+def H2_static_fill_density(P = 1.35, T = 293.15):
+    return 9.66e24 * P/T
+
+
+
+""" 
+Generates H2 ionized logitudinal profile as a function of z [m]. 
+
+The position and density at each position is returned as output in the following order:
+
+[z array, ionized electron density, neutral H2 density]
+
+Args:
+    Nz: Number of positions in z.
+    Z: [m] Maximum z position to generate, inclusive.
+    Z0: [m] Center z position of H2 ionized profile
+"""
+def generate_H2_static_fill_profile(P = 1.35, T = 293.15, Nz = 1001, Z = 4.1, Z0 = 2.1, w = 0.575, c = 14.5, preionized = False, filepath = None):
+
+    # Calculation variables
+    
+    n0 = H2_static_fill_density(P,T)
+    if(not preionized):
+        z = np.linspace(0.0, Z, 2)
+        ne = np.zeros(2, dtype="double")
+        nH = n0 * np.ones(2, dtype = "double") 
+    else:
+        z = np.linspace(0, Z, Nz)
+        # super-gaussian dummy profile for now
+        ne = n0 * np.exp(-(np.abs(z-Z0)/w)**c)
+        nH = n0 - ne
+    return [z,ne, nH]
+
+
+def ballisticPropagation(P, distance):
+    """ Propagates ParticleGroup P ballistically over some distance
+    
+    Parameters
+    ----------
+    P: OpenPMD ParticleGroup
+    distance: propagation distance [m]
+
+    """
+    P.x = P.x + (P['px']/P['pz']) * distance
+    P.y = P.y + (P['py']/P['pz']) * distance
+    P.t = P.t + distance/299792458
+    # Update z?
+
+
 # aux functions for dictionary lookup
 def eq(s, t):
     return s.lower() == t.lower()
@@ -727,34 +784,48 @@ def run_QPAD(tao,
     defaultsFile=None,
     verbose = False,
     **overrides):
+    
+    # markers BE window, PENTS, PEXITS
+    BEWIN1S       = tao.ele_param("BEWIN1","ele.s")['ele_s']
+    PENTS        = tao.ele_param("PENT","ele.s")['ele_s']
+    PEXITS        = tao.ele_param("PEXT","ele.s")['ele_s']
+    BEWIN2S        = tao.ele_param("BEWIN2","ele.s")['ele_s']
+    PENT_to_plasma = 0.25 # distance from PENT to Li oven
+
 
     # read in QPAD settings from file
     if not defaultsFile:
         defaultsFile = f'{tao.filePathGlobal}/qpad/2025-08-20-QPAD_defaults.yml'
         if verbose:
             print(f"No defaults file provided to setLattice(). Using {defaultsFile}")
-        
+     
+    # read in default setting file and sections   
     with open(defaultsFile, 'r') as file:
         defaults = yaml.safe_load(file)
-    # print(defaults)
 
     try: 
         sim_settings = get(defaults, 'simulation')
         grid_settings = get(sim_settings,'grid')
         diag_settings = get(defaults, 'diagnostics')
         plasma_settings = get(defaults, 'plasma')
+        plasma_config = get(plasma_settings,'config')
+        P_torr = get(plasma_settings,'P_torr')
 
     except:
         print(f"Missing sections in {defaultsFile}!")
 
 
-
-
-    # read in plasma config
-    if(eq(plasma_settings['config'], 'oven')):
-        z, nLi, nHe = generate_Li_oven_profile(P = plasma_settings['P_torr'])
+    # Set plasma configuration
+    if(eq(plasma_config, 'oven')):  # oven
+        z, nLi, nHe = generate_Li_oven_profile(P = P_torr)
         n0 = np.max(nLi)
-        zsim = z[-1] - 1e-6
+
+    elif(eq(plasma_config, 'sfill')):   # static fill
+        n0 = H2_static_fill_density(P = P_torr)
+        z, ne, nH = generate_H2_static_fill_profile(P = P_torr, preionized =  get(plasma_settings, 'preionized') )
+
+    else:
+        raise Exception("Plasma config must be 'oven' or 'sfill'")
 
 
     # initialize QPAD simulation object
@@ -768,28 +839,55 @@ def run_QPAD(tao,
 
 
     # reads patchFile, centers <x> and <x'> and exports to QPAD-formatted file 'qpad_file.h5' in 'directory'
-    sim.add_openpmd_file_bunch(PGroup,
-        'qpad_file.h5', 
-        directory = tao.qpadSimPath, 
-        z_select = False,
-        curr_filt = 1e3)
+    if(eq(plasma_config, 'oven')):  # oven
+        PGroup_PENT = getBeamAtElement(tao, "PENT", tToZ = False)
+        ballisticPropagation(PGroup_PENT, PENT_to_plasma) # propagate to start of Li oven PENT+25
+        sim.add_openpmd_file_bunch(PGroup_PENT,
+            'qpad_file.h5', 
+            directory = tao.qpadSimPath, 
+            z_select = False,
+            curr_filt = 1e3)
+    elif(eq(plasma_config, 'sfill')):   # static fill
+        sim.add_openpmd_file_bunch(PGroup,
+            'qpad_file.h5', 
+            directory = tao.qpadSimPath, 
+            z_select = False,
+            curr_filt = 1e3)
+    
+
     
     # Set up plasma source 
-    if(eq(plasma_settings['config'], 'oven')):
-        num_theta = 8 * max(1, get(grid_settings, 'max_mode'))
+    num_theta = 8 * max(1, get(grid_settings, 'max_mode')) # azimuthal ppc
+    if(eq(plasma_config, 'oven')):
+        
         if(not get(plasma_settings, 'preionized')):
+
             sim.add_longitudinal_neutral_gas_profile(z,  nLi,
              particle_type = 'Li', max_level = 1, num_theta = num_theta ) # model first level of Lithium
 
             # sim.add_longitudinal_neutral_gas_profile(z, np.abs(nHe),
             #  particle_type = 'He', max_level = 1, num_theta = num_theta ) # model first level of Helium
+
         else:
             sim.add_longitudinal_plasma_profile(z,  nLi, num_theta = num_theta ) # pre-ionized plasma
+
+    elif(eq(plasma_config, 'sfill')):
+
+        if(not get(plasma_settings, 'preionized')):
+            sim.add_longitudinal_neutral_gas_profile(z,  nH,
+             particle_type = 'H', max_level = 1, num_theta = num_theta ) # model first level of Hydrogen
+
+        else:
+            sim.add_longitudinal_plasma_profile(z,  ne, num_theta = num_theta ) # pre-ionized plasma
+            sim.add_longitudinal_neutral_gas_profile(z,  nH,
+             particle_type = 'H', max_level = 1, num_theta = num_theta ) # model first level of Hydrogen
+
     
 
     
-    dt_qpad = 20
-    final_timestep = int(kp * zsim/dt_qpad)
+    dt_qpad = 20/wp
+    zsim = z[-1] - 1e-6
+    final_timestep = int(kp * zsim/(wp * dt_qpad))
 
     # add diagnostics
     ndumps = get(diag_settings, 'ndumps') or 1
@@ -804,7 +902,7 @@ def run_QPAD(tao,
     
     # Run QPAD Simulation
     print(f"Running QPAD Simulation in {tao.qpadSimPath}")
-    sim.run_simulation(dt = dt_qpad/wp, 
+    sim.run_simulation(dt = dt_qpad, 
                         tmax = zsim/cst.c, 
                         nodes = get(sim_settings, 'nprocs'),
                         sim_dir = tao.qpadSimPath,
@@ -812,8 +910,21 @@ def run_QPAD(tao,
 
     # Export output Beam ParticleGroup
     P = sim.getBeamFromQPAD(tao.qpadSimPath, int(final_timestep/ndumps) * ndumps, tToZ = False)
-    zbeam =  int(final_timestep/ndumps) * ndumps * (dt_qpad/kp)
-    return P, zbeam
+    lsim =  int(final_timestep/ndumps) * ndumps * (dt_qpad/kp)
+
+    # propagate beam
+    marker = "BEWIN2" # next marker
+    ds = 0    # distance to marker
+    if(eq(plasma_config, 'oven')):  # oven
+        ds = max(PEXITS - (PENTS + PENT_to_plasma + lsim), 0.0)
+        marker = "PEXT"
+    else:
+        ds = max(BEWIN2S - (BEWIN1S + lsim), 0.0)
+
+    ballisticPropagation(P, ds) # propagate to next marker
+
+
+    return P, marker
 
   
 
@@ -1336,26 +1447,49 @@ def plotInteractiveQPADFigure(sim_fold = '',
     return ui, update
 
 
-def plotPlasmaProfile(defaultsFile, filepath, figsize = (6,5)):
+def plotPlasmaProfile(defaultsFile, filepath, figsize = (6,5), legend= 'upper center'):
     set_matplotlib_formats('retina')
-    matplotlib.rcParams.update({'figure.dpi': 200, 'savefig.dpi': 300})
+    matplotlib.rcParams.update({'figure.dpi': 200, 'savefig.dpi': 300})    
 
     with open(filepath + '/' + defaultsFile, 'r') as file:
         defaults = yaml.safe_load(file)
+
+    try: 
+        plasma_settings = get(defaults, 'plasma')
+        plasma_config = get(plasma_settings,'config')
+        P_torr = get(plasma_settings,'P_torr')
+    except:
+        print(f"Missing sections in {defaultsFile}!")
+
+
         
-    plasma_settings = defaults['plasma']
-    if(plasma_settings['config'].lower() == 'oven'):
-            z, nLi, nHe = generate_Li_oven_profile(P = plasma_settings['P_torr'])
-            n0 = np.max(nLi)
+    if(eq(plasma_config,'oven')):
+        z, nLi, nHe = generate_Li_oven_profile(P = P_torr)
+        n0 = np.max(nLi)
+    elif(eq(plasma_config, 'sfill')):
+        n0 = H2_static_fill_density(P = P_torr)
+        z, ne, nH = generate_H2_static_fill_profile(P = P_torr, preionized = get(plasma_settings, 'preionized') )
+    else:
+        raise Exception("Plasma config must be 'oven' or 'sfill'")
+
+
     plt.close('all')
     plt.ioff()
     
     fig= plt.figure(figsize=figsize, constrained_layout=True)
     ax = plt.subplot(111)
-    plt.suptitle('Lithium Oven Density Profile')
-    ax.plot(z,nLi/n0, 'k', label = 'Li')
-    ax.plot(z,nHe/n0, 'r', label = 'He')
-    ax.legend(loc='upper center')
+    
+    if(eq(plasma_config,'oven')):
+        plt.suptitle('Lithium Oven Density Profile')
+        ax.plot(z,nLi/n0, 'k', label = 'Li')
+        ax.plot(z,nHe/n0, 'r', label = 'He')
+    else:
+        plt.suptitle('Static Fill Density Profile')
+        ax.plot(z,ne/n0, 'k', label = r'$n_e$')
+        ax.plot(z,nH/n0, 'b', label = 'neutral H2')
+
+    ax.set_ylim(0,1.5)
+    ax.legend(loc=legend)
     ax.set_ylabel(r'$n' + rf'\ [{n0*1e-6:.1e} \ cm^{{-3}}'.replace("+","") + ']$')
     ax.set_xlabel(r'$Z_{sim} \ [m]$')
     return fig

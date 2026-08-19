@@ -302,9 +302,11 @@ def trackBeam(
     BC14BEGS     = tao.ele_param("BEGBC14_1","ele.s")['ele_s']
     BC20BEGS     = tao.ele_param("BEGBC20","ele.s")['ele_s']
     BC20COLLS    = tao.ele_param("CN2069","ele.s")['ele_s']
+    BEWIN1S       = tao.ele_param("BEWIN1","ele.s")['ele_s']
     PENTS        = tao.ele_param("PENT","ele.s")['ele_s']
     MFFFS        = tao.ele_param("MFFF","ele.s")['ele_s']
     PEXITS        = tao.ele_param("PEXT","ele.s")['ele_s']
+    BEWIN2S        = tao.ele_param("BEWIN2","ele.s")['ele_s']
     
     if laserHeater and trackStartS < laserHeaterS < trackEndS:
         #Will track from start to HTRUNDF, get the beam, modify it, export it, import it, update track_start and track_end
@@ -453,36 +455,28 @@ def trackBeam(
         tao.cmd(f'set beam_init track_end = {trackEnd}')
         if verbose: print(f"Set track_start = MFFF, track_end = {trackEnd}")
 
-
-    if plasmaSIM and trackStartS < PEXITS < trackEndS:
-        ## propagate to PEXIT
-        tao.cmd(f'set beam_init track_end = PEXT')
-        if verbose: print(f"Set track_end = PEXT")
+    if plasmaSIM and trackStartS < BEWIN2S < trackEndS:
+        ## propagate to BEWIN2
+        tao.cmd(f'set beam_init track_end = BEWIN2')
+        if verbose: print(f"Set track_end = BEWIN2")
 
         if verbose: print(f"Tracking!")
         trackBeamHelper(tao)
 
-        P = getBeamAtElement(tao, "PENT", tToZ = False)
+        # Beam at Be window
+        P = getBeamAtElement(tao, "BEWIN1", tToZ = False)
 
-        
-        PENT_to_plasma = 0.25 # todo: specify in lattice config
-
-        # ballistic propagation from PENT to plasma
-        ballisticPropagation(P, PENT_to_plasma) 
         # run plasma simulation
-        P2, lsim = run_QPAD(tao, P, defaultsFile = f"{filepath}/" + tao.QPADDefaultsFile)
-        # ballistic propagation from plasma to PEXIT
-        ds = max(PEXITS - (PENTS + PENT_to_plasma + lsim), 0.0)
-        ballisticPropagation(P2, ds)
+        P2, marker = run_QPAD(tao, P, defaultsFile = f"{filepath}/" + tao.QPADDefaultsFile)
         writeBeam(P2, tao.patchFilePath)
         
         tao.cmd(f'set beam_init position_file={tao.patchFilePath}')
         tao.cmd('reinit beam')
         if verbose: print(f"Loaded {tao.patchFilePath}")
 
-        tao.cmd(f'set beam_init track_start = PEXT')
+        tao.cmd(f'set beam_init track_start = {marker}')
         tao.cmd(f'set beam_init track_end = {trackEnd}')
-        if verbose: print(f"Set track_start = PEXT, track_end = {trackEnd}")
+        if verbose: print(f"Set track_start = {marker}, track_end = {trackEnd}")
 
 
     if verbose: print(f"Tracking!")
